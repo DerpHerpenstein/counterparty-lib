@@ -37,6 +37,7 @@ from counterpartycore.lib.api.routes import ROUTES, function_needs_db
 from counterpartycore.lib.backend import bitcoind
 from counterpartycore.lib.cli.initialise import initialise_log_and_config
 from counterpartycore.lib.cli.log import init_api_access_log
+from counterpartycore.lib.ledger import holders
 from counterpartycore.lib.ledger.currentstate import CurrentState
 from counterpartycore.lib.monitors import memory_profiler, sentry
 from counterpartycore.lib.parser import check
@@ -305,7 +306,13 @@ def prepare_args(route, **kwargs):
         if str_arg is not None and str_arg != "":
             if arg_name.startswith("address"):
                 addresses = str_arg.split(",")
-                if not all(address.is_valid_address(addr) for addr in addresses):
+                # An asset name is a valid holder source/destination, so accept
+                # it wherever an address is accepted; the message-level
+                # validation still enforces the holder rules.
+                if not all(
+                    address.is_valid_address(addr) or holders.is_valid_asset_name(addr)
+                    for addr in addresses
+                ):
                     raise ValueError(f"Invalid address: {str_arg}")
             elif arg_name.endswith("_hash") and not helpers.is_valid_tx_hash(str_arg):
                 raise ValueError(f"Invalid transaction hash: {str_arg}")
