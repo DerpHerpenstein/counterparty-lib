@@ -18,21 +18,51 @@ MAX_MEMO_LENGTH = 34
 ID = 2  # 0x02
 
 
-def new_unpack(message):
+def new_unpack(message, block_index=None):
     try:
-        (asset_id, quantity, short_address_bytes, memo_bytes) = cbor2.loads(message)
+        unpacked = cbor2.loads(message)
+        if not isinstance(unpacked, list) or len(unpacked) not in (4, 5):
+            raise exceptions.UnpackError("invalid message length")
+        # The 5th element (the source holder) is only honoured once the
+        # protocol change is active; a pre-activation 5-element message must be
+        # rejected rather than silently accepted.
+        if len(unpacked) == 5 and not protocol.enabled(
+            "assets_hold_assets", block_index=block_index
+        ):
+            raise exceptions.UnpackError("invalid message length")
+
+        asset_id, quantity, destination, memo_bytes = unpacked[0:4]
+        source_asset_id = unpacked[4] if len(unpacked) == 5 else None
+
         asset = ledger.issuances.generate_asset_name(asset_id)
         if asset == config.BTC:
             raise exceptions.AssetNameError(f"{config.BTC} not allowed")
 
-        full_address = address.unpack(short_address_bytes)
+        # CBOR preserves the type: a packed-address is bytes, a holder is a
+        # (numeric) asset-name string.
+        destination_is_holder = isinstance(destination, str)
+        if destination_is_holder:
+            full_address = destination
+        else:
+            full_address = address.unpack(destination)
 
-        return {
+        source_asset = None
+        if source_asset_id is not None:
+            if source_asset_id in (0, 1):
+                raise exceptions.AssetNameError("invalid source asset id")
+            source_asset = ledger.issuances.generate_asset_name(source_asset_id)
+
+        result = {
             "asset": asset,
             "quantity": quantity,
             "address": full_address,
             "memo": None if memo_bytes == b"" else memo_bytes,
         }
+        if destination_is_holder:
+            result["destination_is_holder"] = True
+        if source_asset is not None:
+            result["source_asset"] = source_asset
+        return result
     except Exception as e:  # pylint: disable=broad-exception-caught
         raise exceptions.UnpackError(f"could not unpack: {e}") from e
 
@@ -40,7 +70,7 @@ def new_unpack(message):
 def unpack(message, block_index=None):
     if protocol.enabled("taproot_support", block_index=block_index):
         try:
-            return new_unpack(message)
+            return new_unpack(message, block_index=block_index)
         except exceptions.UnpackError:
             pass  # fallback to legacy unpacking
 
@@ -82,7 +112,7 @@ def unpack(message, block_index=None):
     return unpacked
 
 
-def validate(db, destination, asset, quantity, memo_bytes):
+def validate(db, destination, asset, quantity, memo_bytes, source_asset=None):
     problems = []
 
     if asset == config.BTC:
@@ -105,6 +135,15 @@ def validate(db, destination, asset, quantity, memo_bytes):
     # destination is always required
     if not destination:
         problems.append("destination is required")
+    elif isinstance(destination, str) and ledger.holders.is_valid_asset_name(destination):
+        # A holder destination only needs to be eligible; ownership is not
+        # required to receive.
+        if not ledger.holders.is_asset_holder_eligible(db, destination):
+            problems.append(f"{destination} is not an eligible asset holder")
+
+    # A send from an asset to itself is a no-op and is rejected.
+    if source_asset is not None and destination == source_asset:
+        problems.append("source and destination cannot be the same asset")
 
     # check memo
     if memo_bytes is not None:
@@ -158,8 +197,28 @@ def compose(
     # resolve subassets
     asset = ledger.issuances.resolve_subasset_longname(db, asset)
 
+    # A holder may be the logical source: control belongs to the 1-of-1 owner,
+    # who signs the transaction.
+    source_asset = None
+    signing_source = source
+    if isinstance(source, str) and ledger.holders.is_valid_asset_name(source):
+        source_asset = ledger.holders.resolve_holder(db, source)
+        owner = ledger.holders.get_holder_owner(db, source_asset)
+        if owner is None:
+            if not skip_validation:
+                raise exceptions.ComposeError(f"cannot resolve the 1-of-1 owner of {source_asset}")
+        else:
+            signing_source = owner
+
+    # A holder may be the destination.
+    destination_is_holder = isinstance(
+        destination, str
+    ) and ledger.holders.is_valid_asset_name(destination)
+    if destination_is_holder:
+        destination = ledger.holders.resolve_holder(db, destination)
+
     # Only for outgoing (incoming will overburn).
-    balance = ledger.balances.get_balance(db, source, asset)
+    balance = ledger.balances.get_balance(db, source_asset or signing_source, asset)
     if balance < quantity and not skip_validation:
         raise exceptions.ComposeError("insufficient funds")
 
@@ -178,7 +237,7 @@ def compose(
         memo_bytes = memo.encode("utf-8")
         memo_bytes = struct.pack(f">{len(memo_bytes)}s", memo_bytes)
 
-    problems = validate(db, destination, asset, quantity, memo_bytes)
+    problems = validate(db, destination, asset, quantity, memo_bytes, source_asset=source_asset)
     if problems and not skip_validation:
         raise exceptions.ComposeError(problems)
 
@@ -187,26 +246,38 @@ def compose(
     else:
         asset_id = ledger.issuances.generate_asset_id(asset)
 
-    short_address_bytes = address.pack(destination)
+    if destination_is_holder:
+        short_address_bytes = destination
+    else:
+        short_address_bytes = address.pack(destination)
 
     if protocol.enabled("taproot_support"):
         data = struct.pack(config.SHORT_TXTYPE_FORMAT, ID)
-        data += cbor2.dumps(
-            [
-                asset_id,
-                quantity,
-                short_address_bytes,
-                memo_bytes,
-            ]
-        )
+        payload = [
+            asset_id,
+            quantity,
+            short_address_bytes,
+            memo_bytes,
+        ]
+        if source_asset is not None:
+            if not skip_validation:
+                source_asset_id = ledger.issuances.get_asset_id(db, source_asset)
+            else:
+                source_asset_id = ledger.issuances.generate_asset_id(source_asset)
+            payload.append(source_asset_id)
+        data += cbor2.dumps(payload)
     else:
+        if destination_is_holder or source_asset is not None:
+            raise exceptions.ComposeError(
+                "asset holders require the `assets_hold_assets` protocol change"
+            )
         data = messagetype.pack(ID)
         data += struct.pack(FORMAT, asset_id, quantity, short_address_bytes)
         data += memo_bytes
 
     cursor.close()
     # return an empty array as the second argument because we don't need to send BTC dust to the recipient
-    return (source, [], data)
+    return (signing_source, [], data)
 
 
 def parse(db, tx, message):
@@ -221,14 +292,18 @@ def parse(db, tx, message):
             unpacked["address"],
             unpacked["memo"],
         )
+        destination_is_holder = unpacked.get("destination_is_holder", False)
+        source_asset = unpacked.get("source_asset")
 
         status = "valid"
 
     except (exceptions.UnpackError, exceptions.AssetNameError, struct.error) as e:
         asset, quantity, destination, memo_bytes = None, None, None, None
+        destination_is_holder, source_asset = False, None
         status = f"invalid: could not unpack ({e})"
     except:  # noqa: E722 # pylint: disable=bare-except
         asset, quantity, destination, memo_bytes = None, None, None, None
+        destination_is_holder, source_asset = False, None
         status = "invalid: could not unpack"
 
     if status == "valid":
@@ -246,20 +321,40 @@ def parse(db, tx, message):
             status = "invalid: quantity is too large"
             quantity = None
 
+    # Resolve holder names to their numeric asset name before any ledger op.
+    if status == "valid" and destination_is_holder:
+        try:
+            destination = ledger.holders.resolve_holder(db, destination)
+        except exceptions.AssetNameError as e:
+            status = f"invalid: {e}"
+
+    if status == "valid" and source_asset is not None:
+        try:
+            source_asset = ledger.holders.resolve_holder(db, source_asset)
+        except exceptions.AssetNameError as e:
+            status = f"invalid: {e}"
+
     if status == "valid":
-        problems = validate(db, destination, asset, quantity, memo_bytes)
+        problems = validate(db, destination, asset, quantity, memo_bytes, source_asset=source_asset)
         if problems:
             status = "invalid: " + "; ".join(problems)
 
+    if status == "valid" and source_asset is not None:
+        ok, problem = ledger.holders.check_source_holder(db, tx["source"], source_asset)
+        if not ok:
+            status = f"invalid: {problem}"
+
     if status == "valid":
         # verify balance is present
-        balance = ledger.balances.get_balance(db, tx["source"], asset)
+        debit_source = source_asset if source_asset is not None else tx["source"]
+        balance = ledger.balances.get_balance(db, debit_source, asset)
         if balance == 0 or balance < quantity:
             status = "invalid: insufficient funds"
 
     if status == "valid":
+        debit_source = source_asset if source_asset is not None else tx["source"]
         ledger.events.debit(
-            db, tx["source"], asset, quantity, tx["tx_index"], action="send", event=tx["tx_hash"]
+            db, debit_source, asset, quantity, tx["tx_index"], action="send", event=tx["tx_hash"]
         )
         ledger.events.credit(
             db, destination, asset, quantity, tx["tx_index"], action="send", event=tx["tx_hash"]
@@ -270,7 +365,7 @@ def parse(db, tx, message):
         "tx_index": tx["tx_index"],
         "tx_hash": tx["tx_hash"],
         "block_index": tx["block_index"],
-        "source": tx["source"],
+        "source": source_asset if source_asset is not None else tx["source"],
         "destination": destination,
         "asset": asset,
         "quantity": quantity,
