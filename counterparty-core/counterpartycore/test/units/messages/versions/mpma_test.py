@@ -8,6 +8,7 @@ from counterpartycore.lib.utils import address
 from counterpartycore.lib.utils.mpmaencoding import (
     _decode_decode_lut,
     _decode_mpma_send_decode,
+    _decode_mpma_send_decode_full,
     _encode_compress_lut,
     _encode_construct_lut,
     _encode_mpma_send,
@@ -1007,4 +1008,59 @@ def test_parse_2_assets(ledger_db, blockchain_mock, defaults, test_helpers, curr
                 },
             },
         ],
+    )
+
+
+def test_encode_decode_holder_source(defaults, monkeypatch):
+    """A holder source emits the 1-byte source flag + 8-byte asset id."""
+    monkeypatch.setattr(ledger.issuances, "resolve_subasset_longname", lambda db, asset: asset)
+    monkeypatch.setattr(ledger.issuances, "get_asset_id", lambda db, asset: 1)
+
+    sends = [
+        ("XCP", defaults["addresses"][1], 1),
+        ("XCP", defaults["addresses"][2], 2),
+    ]
+    encoded = _encode_mpma_send(None, sends, block_index=10**8, source_asset_id=95428959342453541)
+    decoded, source_asset_id = _decode_mpma_send_decode_full(encoded, block_index=10**8)
+
+    assert source_asset_id == 95428959342453541
+    assert sorted(decoded["XCP"]) == sorted(
+        [(defaults["addresses"][1], 1), (defaults["addresses"][2], 2)]
+    )
+
+
+def test_encode_decode_holder_lut_entry(defaults, monkeypatch):
+    """A holder destination is a 0xFF-marked LUT entry."""
+    monkeypatch.setattr(ledger.issuances, "resolve_subasset_longname", lambda db, asset: asset)
+    monkeypatch.setattr(ledger.issuances, "get_asset_id", lambda db, asset: 1)
+
+    sends = [
+        ("XCP", "A95428959342453541", 1),
+        ("XCP", defaults["addresses"][1], 2),
+    ]
+    encoded = _encode_mpma_send(None, sends, block_index=10**8)
+    decoded, source_asset_id = _decode_mpma_send_decode_full(encoded, block_index=10**8)
+
+    assert source_asset_id is None
+    assert sorted(decoded["XCP"]) == sorted(
+        [("A95428959342453541", 1), (defaults["addresses"][1], 2)]
+    )
+
+
+def test_no_source_flag_before_activation(defaults, monkeypatch):
+    """Before assets_hold_assets no source flag byte is emitted."""
+    monkeypatch.setattr(ledger.issuances, "resolve_subasset_longname", lambda db, asset: asset)
+    monkeypatch.setattr(ledger.issuances, "get_asset_id", lambda db, asset: 1)
+
+    sends = [
+        ("XCP", defaults["addresses"][1], 1),
+        ("XCP", defaults["addresses"][2], 2),
+    ]
+    with ProtocolChangesDisabled(["assets_hold_assets"]):
+        encoded = _encode_mpma_send(None, sends, block_index=10**8)
+        decoded, source_asset_id = _decode_mpma_send_decode_full(encoded, block_index=10**8)
+
+    assert source_asset_id is None
+    assert sorted(decoded["XCP"]) == sorted(
+        [(defaults["addresses"][1], 1), (defaults["addresses"][2], 2)]
     )

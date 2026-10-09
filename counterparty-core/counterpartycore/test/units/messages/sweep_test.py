@@ -226,6 +226,79 @@ def test_new_unpack(defaults):
         )
 
 
+def test_new_unpack_holder_source(defaults):
+    message = cbor2.dumps(
+        [
+            b"\x00" + bytes.fromhex("8d6ae8a3b381663118b4e1eff4cfc7d0954dd6ec"),
+            1,
+            b"",
+            95428959342453541,
+        ]
+    )
+    result = sweep.new_unpack(message, block_index=10**8)
+    assert result["destination"] == defaults["addresses"][1]
+    assert result["source_asset_id"] == 95428959342453541
+
+
+def test_new_unpack_holder_destination(defaults):
+    message = cbor2.dumps(["A95428959342453541", 1, b""])
+    result = sweep.new_unpack(message, block_index=10**8)
+    assert result["destination"] == "A95428959342453541"
+
+
+def test_new_unpack_rejects_holder_elements_before_activation(defaults):
+    with ProtocolChangesDisabled(["assets_hold_assets"]):
+        with pytest.raises(exceptions.UnpackError):
+            sweep.new_unpack(
+                cbor2.dumps(
+                    [
+                        b"\x00" + bytes.fromhex("8d6ae8a3b381663118b4e1eff4cfc7d0954dd6ec"),
+                        1,
+                        b"",
+                        95428959342453541,
+                    ]
+                ),
+                block_index=10**8,
+            )
+        with pytest.raises(exceptions.UnpackError):
+            sweep.new_unpack(cbor2.dumps(["A95428959342453541", 1, b""]), block_index=10**8)
+
+
+def test_new_unpack_rejects_btc_xcp_source_asset_id(defaults):
+    for source_asset_id in (0, 1):
+        with pytest.raises(exceptions.UnpackError):
+            sweep.new_unpack(
+                cbor2.dumps(
+                    [
+                        b"\x00" + bytes.fromhex("8d6ae8a3b381663118b4e1eff4cfc7d0954dd6ec"),
+                        1,
+                        b"",
+                        source_asset_id,
+                    ]
+                ),
+                block_index=10**8,
+            )
+
+
+def test_allowed_flags_gated():
+    with ProtocolChangesDisabled(["assets_hold_assets"]):
+        assert sweep.allowed_flags(10**8) == sweep.FLAGS_ALL
+    assert sweep.allowed_flags(10**8) == sweep.FLAGS_ALL | sweep.FLAG_ASSET_HOLDER_PAYS
+
+
+def test_validate_rejects_holder_pays_flag_before_activation(ledger_db, defaults):
+    with ProtocolChangesDisabled(["assets_hold_assets"]):
+        problems, _total_fee = sweep.validate(
+            ledger_db,
+            defaults["addresses"][6],
+            defaults["addresses"][5],
+            sweep.FLAG_BALANCES | sweep.FLAG_ASSET_HOLDER_PAYS,
+            None,
+            config.BURN_START,
+        )
+        assert "invalid flags 9" in problems
+
+
 def test_unpack(defaults):
     with ProtocolChangesDisabled("taproot_support"):
         assert sweep.unpack(

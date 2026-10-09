@@ -212,6 +212,70 @@ def test_unpack_with_block_index_uses_cbor_when_taproot_on(ledger_db, defaults):
     assert result["quantity"] == 1000
 
 
+def test_new_unpack_holder_source(ledger_db, defaults):
+    """A 5-element CBOR payload carries a source holder asset id."""
+    message = cbor2.dumps(
+        [
+            1,
+            1000,
+            b"\x00" + bytes.fromhex("8d6ae8a3b381663118b4e1eff4cfc7d0954dd6ec"),
+            b"",
+            95428959342453541,
+        ]
+    )
+    result = enhancedsend.new_unpack(message, block_index=10**8)
+    assert result["asset"] == "XCP"
+    assert result["quantity"] == 1000
+    assert result["source_asset"] == "A95428959342453541"
+
+
+def test_new_unpack_holder_destination(ledger_db, defaults):
+    """A string destination is a holder."""
+    message = cbor2.dumps([1, 1000, "A95428959342453541", b""])
+    result = enhancedsend.new_unpack(message, block_index=10**8)
+    assert result["address"] == "A95428959342453541"
+    assert result["destination_is_holder"] is True
+
+
+def test_new_unpack_rejects_holder_elements_before_activation(ledger_db, defaults):
+    with ProtocolChangesDisabled(["assets_hold_assets"]):
+        with pytest.raises(exceptions.UnpackError):
+            enhancedsend.new_unpack(
+                cbor2.dumps(
+                    [
+                        1,
+                        1000,
+                        b"\x00" + bytes.fromhex("8d6ae8a3b381663118b4e1eff4cfc7d0954dd6ec"),
+                        b"",
+                        95428959342453541,
+                    ]
+                ),
+                block_index=10**8,
+            )
+        with pytest.raises(exceptions.UnpackError):
+            enhancedsend.new_unpack(
+                cbor2.dumps([1, 1000, "A95428959342453541", b""]),
+                block_index=10**8,
+            )
+
+
+def test_new_unpack_rejects_btc_xcp_source_asset_id(ledger_db, defaults):
+    for source_asset_id in (0, 1):
+        with pytest.raises(exceptions.UnpackError):
+            enhancedsend.new_unpack(
+                cbor2.dumps(
+                    [
+                        1,
+                        1000,
+                        b"\x00" + bytes.fromhex("8d6ae8a3b381663118b4e1eff4cfc7d0954dd6ec"),
+                        b"",
+                        source_asset_id,
+                    ]
+                ),
+                block_index=10**8,
+            )
+
+
 def test_validate_rejects_non_bytes_memo(ledger_db, defaults):
     """CBOR-encoded messages can supply any type for memo; validate must
     reject anything that isn't bytes-like before calling len()."""
