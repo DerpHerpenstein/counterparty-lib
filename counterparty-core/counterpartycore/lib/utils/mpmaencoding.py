@@ -32,6 +32,14 @@ def _encode_construct_lut(sends):
     return {"nbits": lut_nbits, "addrs": base_lut}
 
 
+def _holders_enabled(block_index=None):
+    """Asset holders in MPMA require both the length-prefixed LUT
+    (`mpma_taproot_support`) and the `assets_hold_assets` gate."""
+    return protocol.enabled("assets_hold_assets", block_index=block_index) and protocol.enabled(
+        "mpma_taproot_support", block_index=block_index
+    )
+
+
 def _encode_compress_lut(lut, block_index=None):
     # `pack_legacy` emits a fixed 21 bytes, which holds a 20 byte hash or witness program and
     # nothing longer, so a Taproot (32 byte program) or P2WSH destination could not be encoded at
@@ -40,11 +48,20 @@ def _encode_compress_lut(lut, block_index=None):
     # length, so each entry is prefixed with its own length. It is called directly rather than
     # through `address.pack`, whose legacy fallback would write bytes the decoder refuses.
     if protocol.enabled("mpma_taproot_support", block_index=block_index):
+        holders_enabled = _holders_enabled(block_index)
         entries = []
         for addr in lut["addrs"]:
-            packed = bytes(utils.pack_address(addr, config.NETWORK_NAME))
-            entries.append(struct.pack(">B", len(packed)))
-            entries.append(packed)
+            if holders_enabled and ledger.holders.is_valid_asset_name(addr):
+                # 0xFF is never a valid packed-address length, so it marks an
+                # asset-name (holder) entry: [0xFF][len][UTF-8 name].
+                name_bytes = addr.encode("utf-8")
+                entries.append(struct.pack(">B", 0xFF))
+                entries.append(struct.pack(">B", len(name_bytes)))
+                entries.append(name_bytes)
+            else:
+                packed = bytes(utils.pack_address(addr, config.NETWORK_NAME))
+                entries.append(struct.pack(">B", len(packed)))
+                entries.append(packed)
         return b"".join([struct.pack(">H", len(lut["addrs"]))] + entries)
 
     return b"".join(
@@ -136,8 +153,21 @@ def _encode_construct_sends(sends):
     return {"lut": lut, "sendLists": send_lists}
 
 
-def _encode_compress_sends(db, mpma_send, memo=None, memo_is_hex=False, block_index=None):
+def _encode_compress_sends(
+    db, mpma_send, memo=None, memo_is_hex=False, block_index=None, source_asset_id=None
+):
     compressed_lut = _encode_compress_lut(mpma_send["lut"], block_index=block_index)
+
+    # The 1-byte source flag sits between the LUT and the bit-packed stream. It
+    # is only emitted once holders are enabled; before that the first byte of
+    # the bit-packed stream would be misread as a flag.
+    source_flag = b""
+    if _holders_enabled(block_index):
+        if source_asset_id is None:
+            source_flag = struct.pack(">B", 0x00)
+        else:
+            source_flag = struct.pack(">B", 0x01) + struct.pack(">Q", source_asset_id)
+
     memo_arr = _encode_memo(memo, memo_is_hex).bin
 
     isends = (
@@ -158,13 +188,20 @@ def _encode_compress_sends(db, mpma_send, memo=None, memo_is_hex=False, block_in
     bstr = "".join([isends, "0"])
     pad = "0" * ((8 - (len(bstr) - 2)) % 8)  # That -2 is because the prefix 0b is there
     barr = BitArray(bstr + pad)
-    return b"".join([compressed_lut, barr.bytes])
+    return b"".join([compressed_lut, source_flag, barr.bytes])
 
 
-def _encode_mpma_send(db, sends, memo=None, memo_is_hex=False, block_index=None):
+def _encode_mpma_send(
+    db, sends, memo=None, memo_is_hex=False, block_index=None, source_asset_id=None
+):
     mpma = _encode_construct_sends(sends)
     send = _encode_compress_sends(
-        db, mpma, memo=memo, memo_is_hex=memo_is_hex, block_index=block_index
+        db,
+        mpma,
+        memo=memo,
+        memo_is_hex=memo_is_hex,
+        block_index=block_index,
+        source_asset_id=source_asset_id,
     )
 
     return send
@@ -179,12 +216,23 @@ def _decode_decode_lut(data, block_index=None):
         raise exceptions.DecodeError("address list can't be empty")
     p = 2
     address_list = []
+    holders_enabled = _holders_enabled(block_index)
 
     if protocol.enabled("mpma_taproot_support", block_index=block_index):
         for _i in range(0, num_addresses):  # noqa: B007
             # Each entry carries its own length; see `_encode_compress_lut`.
             (bytes_per_address,) = struct.unpack(">B", data[p : p + 1])
             p += 1
+            if holders_enabled and bytes_per_address == 0xFF:
+                # Asset-name (holder) entry: [0xFF][len][UTF-8 name].
+                (name_len,) = struct.unpack(">B", data[p : p + 1])
+                p += 1
+                name_bytes = data[p : p + name_len]
+                if len(name_bytes) != name_len:
+                    raise exceptions.DecodeError("truncated address list")
+                address_list.append(name_bytes.decode("utf-8"))
+                p += name_len
+                continue
             if bytes_per_address == 0:
                 raise exceptions.DecodeError("address can't be empty")
 
@@ -272,8 +320,28 @@ def _decode_memo(stream):
     return None, None
 
 
-def _decode_mpma_send_decode(data, block_index=None):
+def _decode_mpma_send_decode_full(data, block_index=None):
+    """Decode an MPMA message, returning ``(sends, source_asset_id)``.
+
+    ``source_asset_id`` is ``None`` when the transaction's real source address
+    is used, or the numeric asset id of the source holder.
+    """
     lut, nbits, remain = _decode_decode_lut(data, block_index=block_index)
+
+    source_asset_id = None
+    if _holders_enabled(block_index):
+        if len(remain) < 1:
+            raise exceptions.DecodeError("truncated data")
+        (source_flag,) = struct.unpack(">B", remain[0:1])
+        remain = remain[1:]
+        if source_flag == 0x01:
+            if len(remain) < 8:
+                raise exceptions.DecodeError("truncated data")
+            (source_asset_id,) = struct.unpack(">Q", remain[0:8])
+            remain = remain[8:]
+        elif source_flag != 0x00:
+            raise exceptions.DecodeError("invalid source flag")
+
     stream = ConstBitStream(remain)
     memo, is_hex = _decode_memo(stream)
     sends = _decode_decode_sends(stream, nbits, lut)
@@ -283,4 +351,9 @@ def _decode_mpma_send_decode(data, block_index=None):
                 if len(send) == 2:
                     send_list[idx] = (send[0], send[1], memo, is_hex)
 
+    return sends, source_asset_id
+
+
+def _decode_mpma_send_decode(data, block_index=None):
+    sends, _source_asset_id = _decode_mpma_send_decode_full(data, block_index=block_index)
     return sends

@@ -215,7 +215,7 @@ def test_compose_taproot_destination(ledger_db, defaults):
         defaults["addresses"][0],
         [],
         binascii.unhexlify(
-            "0300022203018790903eefbbb8ac03e5e884f76127186e3d18d9c93331f10dd112ad4426415615018d6ae8a3b381663118b4e1eff4cfc7d0954dd6ec400000000000000060000000005f5e10040000000017d78400"
+            "0300022203018790903eefbbb8ac03e5e884f76127186e3d18d9c93331f10dd112ad4426415615018d6ae8a3b381663118b4e1eff4cfc7d0954dd6ec00400000000000000060000000005f5e10040000000017d78400"
         ),
     )
 
@@ -233,7 +233,7 @@ def test_compose_taproot_destination(ledger_db, defaults):
         defaults["addresses"][0],
         [],
         binascii.unhexlify(
-            "0300022203018790903eefbbb8ac03e5e884f76127186e3d18d9c93331f10dd112ad4426415622030171653075b36ee3d2351b5581d9b9905721cbfe60b71ce22501e1b44ed03a9684400000000000000060000000005f5e10040000000017d78400"
+            "0300022203018790903eefbbb8ac03e5e884f76127186e3d18d9c93331f10dd112ad4426415622030171653075b36ee3d2351b5581d9b9905721cbfe60b71ce22501e1b44ed03a968400400000000000000060000000005f5e10040000000017d78400"
         ),
     )
 
@@ -332,7 +332,7 @@ def test_compose_encodes_for_next_block(ledger_db, defaults, monkeypatch):
     """A compose is encoded under the rules of the block the transaction can next be mined in."""
     captured = {}
 
-    def fake_encode(db, sends, memo=None, memo_is_hex=False, block_index=None):
+    def fake_encode(db, sends, memo=None, memo_is_hex=False, block_index=None, source_asset_id=None):
         captured["block_index"] = block_index
         return b""
 

@@ -10,6 +10,7 @@ from counterpartycore.lib.parser import messagetype, protocol
 from counterpartycore.lib.utils import address, helpers
 from counterpartycore.lib.utils.mpmaencoding import (
     _decode_mpma_send_decode,
+    _decode_mpma_send_decode_full,
     _encode_mpma_send,
 )
 
@@ -28,6 +29,17 @@ def py34_tuple_append(first_elem, t):
     return tuple(l)
 
 
+def _resolve_holder_destinations(db, asset_credits):
+    """Resolve any holder destination (longname -> numeric name)."""
+    resolved = []
+    for credit in asset_credits:
+        destination = credit[0]
+        if isinstance(destination, str) and ledger.holders.is_valid_asset_name(destination):
+            destination = ledger.holders.resolve_holder(db, destination)
+        resolved.append((destination,) + tuple(credit[1:]))
+    return resolved
+
+
 ## expected functions for message version
 def unpack(message, block_index=None):
     try:
@@ -42,7 +54,19 @@ def unpack(message, block_index=None):
     return unpacked
 
 
-def validate(db, asset_dest_quant_list):
+def unpack_full(message, block_index=None):
+    """Like ``unpack`` but also returns the source holder's asset id (or None)."""
+    try:
+        return _decode_mpma_send_decode_full(message, block_index=block_index)
+    except struct.error as e:
+        raise exceptions.UnpackError("could not unpack") from e
+    except (exceptions.AssetNameError, exceptions.AssetIDError) as e:
+        raise exceptions.UnpackError("invalid asset in mpma send") from e
+    except ReadError as e:
+        raise exceptions.UnpackError("truncated data") from e
+
+
+def validate(db, asset_dest_quant_list, source_asset=None):
     problems = []
 
     if len(asset_dest_quant_list) == 0:
@@ -89,6 +113,13 @@ def validate(db, asset_dest_quant_list):
         # destination is always required
         if not destination:
             problems.append(f"destination is required for {asset}")
+        elif isinstance(destination, str) and ledger.holders.is_valid_asset_name(destination):
+            # A holder destination only needs to be eligible; ownership is not
+            # required to receive.
+            if not ledger.holders.is_asset_holder_eligible(db, destination):
+                problems.append(f"{destination} is not an eligible asset holder")
+            if source_asset is not None and destination == source_asset:
+                problems.append(f"source and destination cannot be the same asset for {asset}")
 
         if protocol.enabled("options_require_memo"):
             results = ledger.other.get_addresses(db, address=destination) if destination else None
@@ -106,8 +137,8 @@ def validate(db, asset_dest_quant_list):
     return problems
 
 
-def validate_compose(db, asset_dest_quant_list):
-    problems = validate(db, asset_dest_quant_list)
+def validate_compose(db, asset_dest_quant_list, source_asset=None):
+    problems = validate(db, asset_dest_quant_list, source_asset=source_asset)
     seen = set()
     duplicate_problem = "cannot specify more than once a destination per asset"
     for send in asset_dest_quant_list:
@@ -147,6 +178,28 @@ def compose(
     # table if it is going to be parsed with the new one.
     next_block_index = ledger.blocks.last_db_index(db) + 1
 
+    # A holder may be the logical source: control belongs to the 1-of-1 owner,
+    # who signs the transaction.
+    source_asset = None
+    signing_source = source
+    if isinstance(source, str) and ledger.holders.is_valid_asset_name(source):
+        source_asset = ledger.holders.resolve_holder(db, source)
+        owner = ledger.holders.get_holder_owner(db, source_asset)
+        if owner is None:
+            if not skip_validation:
+                raise exceptions.ComposeError(f"cannot resolve the 1-of-1 owner of {source_asset}")
+        else:
+            signing_source = owner
+
+    # Resolve holder destinations (longnames -> numeric names) before encoding.
+    resolved_list = []
+    for send in asset_dest_quant_list:
+        destination = send[1]
+        if isinstance(destination, str) and ledger.holders.is_valid_asset_name(destination):
+            destination = ledger.holders.resolve_holder(db, destination)
+        resolved_list.append((send[0], destination) + tuple(send[2:]))
+    asset_dest_quant_list = resolved_list
+
     # Until `mpma_taproot_support` activates the lookup table cannot carry a witness program
     # longer than 20 bytes, so a compose that accepted one would produce a message the network
     # cannot parse. After activation the Rust packer decides what is representable.
@@ -154,6 +207,10 @@ def compose(
         for send in asset_dest_quant_list:
             destination = send[1]
 
+            if isinstance(destination, str) and ledger.holders.is_valid_asset_name(destination):
+                raise exceptions.ComposeError(
+                    "asset holders require the `assets_hold_assets` protocol change"
+                )
             if len(address.pack(destination)) > 22:
                 raise exceptions.ComposeError(f"Address not supported by MPMA send: {destination}")
 
@@ -171,15 +228,22 @@ def compose(
         if not isinstance(quantity, int):
             raise exceptions.ComposeError(f"quantities must be an int (in satoshis) for {asset}")
 
-        balance = ledger.balances.get_balance(db, source, asset)
+        balance = ledger.balances.get_balance(db, source_asset or signing_source, asset)
         if balance < quantity and not skip_validation:
             raise exceptions.ComposeError(f"insufficient funds for {asset}")
 
     cursor.close()
 
-    problems = validate_compose(db, asset_dest_quant_list)
+    problems = validate_compose(db, asset_dest_quant_list, source_asset=source_asset)
     if problems and not skip_validation:
         raise exceptions.ComposeError(problems)
+
+    source_asset_id = None
+    if source_asset is not None:
+        if not skip_validation:
+            source_asset_id = ledger.issuances.get_asset_id(db, source_asset)
+        else:
+            source_asset_id = ledger.issuances.generate_asset_id(source_asset)
 
     data = messagetype.pack(ID)
 
@@ -190,11 +254,12 @@ def compose(
             memo=memo,
             memo_is_hex=memo_is_hex,
             block_index=next_block_index,
+            source_asset_id=source_asset_id,
         )
     except Exception as e:  # pylint: disable=broad-except
         raise exceptions.ComposeError(f"couldn't encode MPMA send: {e}") from e
 
-    return (source, [], data)
+    return (signing_source, [], data)
 
 
 def parse(db, tx, message):
@@ -204,8 +269,13 @@ def parse(db, tx, message):
         # transaction under the rules of the block it can next be mined in.
         block_index = ledger.blocks.last_db_index(db) + 1
 
+    source_asset = None
     try:
-        unpacked = unpack(message, block_index=block_index)
+        unpacked, source_asset_id = unpack_full(message, block_index=block_index)
+        if source_asset_id is not None:
+            if source_asset_id in (0, 1):
+                raise exceptions.AssetNameError("invalid source asset id")
+            source_asset = ledger.issuances.generate_asset_name(source_asset_id)
         status = "valid"
     except struct.error:
         status = "invalid: truncated message"
@@ -215,6 +285,18 @@ def parse(db, tx, message):
         status = f"invalid: couldn't unpack; {e}"
 
     cursor = db.cursor()
+
+    if status == "valid" and source_asset is not None:
+        try:
+            source_asset = ledger.holders.resolve_holder(db, source_asset)
+        except exceptions.AssetNameError as e:
+            status = f"invalid: {e}"
+        else:
+            ok, problem = ledger.holders.check_source_holder(db, tx["source"], source_asset)
+            if not ok:
+                status = f"invalid: {problem}"
+
+    debit_source = source_asset if source_asset is not None else tx["source"]
 
     plain_sends = []
     all_debits = []
@@ -227,9 +309,16 @@ def parse(db, tx, message):
                 status = f"invalid: asset {asset_id} invalid at block index {tx['block_index']}"
                 break
 
-            balance = ledger.balances.get_balance(db, tx["source"], asset_id)
+            # Resolve holder destinations (longnames -> numeric names).
+            try:
+                asset_credits = _resolve_holder_destinations(db, asset_credits)
+            except exceptions.AssetNameError as e:
+                status = f"invalid: {e}"
+                break
+
+            balance = ledger.balances.get_balance(db, debit_source, asset_id)
             if not balance:
-                status = f"invalid: insufficient funds for asset {asset_id}, address {tx['source']} has no balance"
+                status = f"invalid: insufficient funds for asset {asset_id}, address {debit_source} has no balance"
                 break
 
             total_sent = reduce(lambda p, t: p + t[1], asset_credits, 0)
@@ -247,7 +336,7 @@ def parse(db, tx, message):
                 all_debits.append({"asset": asset_id, "quantity": total_sent})
 
     if status == "valid":
-        problems = validate(db, plain_sends)
+        problems = validate(db, plain_sends, source_asset=source_asset)
 
         if problems:
             status = "invalid:" + "; ".join(problems)
@@ -267,7 +356,7 @@ def parse(db, tx, message):
         for op in all_debits:
             ledger.events.debit(
                 db,
-                tx["source"],
+                debit_source,
                 op["asset"],
                 op["quantity"],
                 tx["tx_index"],
@@ -287,7 +376,7 @@ def parse(db, tx, message):
                 "tx_index": tx["tx_index"],
                 "tx_hash": tx["tx_hash"],
                 "block_index": tx["block_index"],
-                "source": tx["source"],
+                "source": debit_source,
                 "asset": op[0],
                 "destination": op[1],
                 "quantity": op[2],
