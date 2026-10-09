@@ -1529,5 +1529,15 @@
         "testnet3_block_index": 5151805,
         "testnet4_block_index": 154564,
         "signet_block_index": 324359
+    },
+    "assets_hold_assets": {
+        "_comment": "Allow a locked, indivisible, supply-1 asset to be the source and/or destination of an enhanced_send, MPMA or sweep. Control of a holder belongs to whoever holds its single unit. Must activate after `taproot_support` (CBOR payloads) and `mpma_taproot_support` (length-prefixed MPMA LUT).",
+        "minimum_version_major": 11,
+        "minimum_version_minor": 6,
+        "minimum_version_revision": 0,
+        "block_index": 980000,
+        "testnet3_block_index": 5300000,
+        "testnet4_block_index": 170000,
+        "signet_block_index": 330000
     }
 }
